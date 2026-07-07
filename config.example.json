@@ -1,0 +1,10 @@
+{
+  "authors": ["you@example.com", "yourname@users.noreply.github.com"],
+  "githubAuthor": "@me",
+  "firstWeekStart": "20260511",
+  "outputDir": "..",
+  "projects": [
+    { "name": "Project A", "path": "../../project-a" },
+    { "name": "Project B", "path": "../../project-b" }
+  ]
+}
