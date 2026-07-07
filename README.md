@@ -10,12 +10,17 @@ cd generator
 go run .              # or: ./run.sh
 go run . path/to/other-config.json
 go run . -n           # dry run: report what would change without writing
+go run . -all         # refetch and re-render every week since firstWeekStart
 ```
 
-Output lands in `outputDir` (default `..`, i.e. the `daily/` folder). Projects
-are collected in parallel. Re-running is **incremental**: a week's file is only
-rewritten when its git-derived content changed (it reports `N written, M
-unchanged`).
+Output lands in `outputDir` (default `..`, i.e. the `daily/` folder), plus an
+auto-generated `INDEX.md` summary table. Projects are collected in parallel.
+
+By default only **recent weeks** are fetched and re-rendered: from the previous
+week's Monday, extended back to the newest week file on disk (so gaps from
+skipped runs are backfilled). Older files are left untouched; use `-all` to
+rebuild everything. A week's file is only rewritten when its derived content
+changed (it reports `N written, M unchanged`).
 
 ## Config (`config.json`)
 
@@ -64,8 +69,13 @@ and is yours to edit once the file exists.
 ## How the auto block is derived
 
 - **Commits**: non-merge commits by you on that day, across all branches/remotes
-  (stash excluded), grouped by author date. Each shows its diff size `(+A -D)`
-  from `git log --numstat` (binary files count as 0).
+  (stash excluded), grouped by author date. Each links to the commit on GitHub
+  and shows its diff size `(+A -D)` from `git log --numstat` (binary files
+  count as 0). PR numbers link to GitHub too.
+- **Week stats**: a `stats:` line under each week title (commits, +/- lines,
+  PRs opened/merged), also collected into `INDEX.md`.
+- **Day activity span**: a `(commit activity HH:MM - HH:MM)` line under each day
+  header — first to last commit author time that day, handy for timesheets.
 - **PRs**: your PRs via `gh pr list --author <githubAuthor>` (server-side
   filtered to `updated:>=` the first week; it warns if the 300-PR page fills
   up), anchored to the day they were opened/merged/closed, with `(base <- head)`
