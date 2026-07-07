@@ -188,8 +188,18 @@ func main() {
 		if r.err != nil {
 			fail(r.err)
 		}
-		// Merge commits are housekeeping; skip them — PRs cover merges.
+		// Merge commits are housekeeping; skip them in lists/stats — PRs
+		// cover merges. They still count toward the day's activity span:
+		// a locally-run merge is the author at the keyboard.
 		for _, c := range r.commits {
+			if c.hhmm != "" {
+				if ts := dayTimes[c.dateStr]; ts == nil {
+					dayTimes[c.dateStr] = &timeSpan{c.hhmm, c.hhmm}
+				} else {
+					ts.min = min(ts.min, c.hhmm)
+					ts.max = max(ts.max, c.hhmm)
+				}
+			}
 			if c.isMerge {
 				continue
 			}
@@ -202,14 +212,6 @@ func main() {
 			ws.commits++
 			ws.add += c.add
 			ws.del += c.del
-			if c.hhmm != "" {
-				if ts := dayTimes[c.dateStr]; ts == nil {
-					dayTimes[c.dateStr] = &timeSpan{c.hhmm, c.hhmm}
-				} else {
-					ts.min = min(ts.min, c.hhmm)
-					ts.max = max(ts.max, c.hhmm)
-				}
-			}
 		}
 		for _, ev := range r.prEvents {
 			sec := cell(ev.date, r.name)
@@ -421,8 +423,12 @@ const fieldSep = "\x1f"
 func gitLog(projPath string, authors []string, since string, branches map[string][]string) ([]commit, error) {
 	args := []string{
 		"log", "--branches", "--remotes", "--no-color", "--numstat",
-		"--date=format:%Y-%m-%d %H:%M",
-		"--pretty=format:%h" + fieldSep + "%ad" + fieldSep + "%P" + fieldSep + "%s",
+		// format-local: commits carry whatever tz they were authored in
+		// (GitHub-generated ones are especially arbitrary); normalize all
+		// timestamps to this machine's tz so day buckets and activity
+		// spans line up with the author's actual working hours.
+		"--date=format-local:%Y-%m-%d %H:%M",
+		"--pretty=format:%h" + fieldSep + "%ad" + fieldSep + "%P" + fieldSep + "%ce" + fieldSep + "%s",
 		"--since=" + since,
 	}
 	for _, a := range authors {
@@ -432,6 +438,10 @@ func gitLog(projPath string, authors []string, since string, branches map[string
 	if err != nil {
 		return nil, err
 	}
+	return parseGitLog(out, branches), nil
+}
+
+func parseGitLog(out []byte, branches map[string][]string) []commit {
 	var commits []commit
 	var cur *commit
 	flush := func() {
@@ -442,8 +452,17 @@ func gitLog(projPath string, authors []string, since string, branches map[string
 	for line := range strings.SplitSeq(string(out), "\n") {
 		if strings.Contains(line, fieldSep) { // commit header
 			flush()
-			parts := strings.SplitN(line, fieldSep, 4)
-			if len(parts) != 4 {
+			parts := strings.SplitN(line, fieldSep, 5)
+			if len(parts) != 5 {
+				cur = nil
+				continue
+			}
+			// GitHub-committed commits (squash/merge buttons, web edits)
+			// are authored *as* the PR author but may be created by anyone
+			// at any time; the PR section already records merges, so
+			// counting these here double-counts diffs and pollutes the
+			// activity span.
+			if parts[3] == "noreply@github.com" {
 				cur = nil
 				continue
 			}
@@ -457,7 +476,7 @@ func gitLog(projPath string, authors []string, since string, branches map[string
 				dateStr:  t.Format(dateLayout),
 				hhmm:     t.Format("15:04"),
 				isMerge:  len(strings.Fields(parts[2])) > 1,
-				subject:  parts[3],
+				subject:  parts[4],
 				branches: branches[parts[0]],
 			}
 			continue
@@ -471,7 +490,7 @@ func gitLog(projPath string, authors []string, since string, branches map[string
 		}
 	}
 	flush()
-	return commits, nil
+	return commits
 }
 
 func atoiSafe(s string) int {
