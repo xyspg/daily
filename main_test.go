@@ -2,6 +2,7 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -34,7 +35,7 @@ func TestPREvents(t *testing.T) {
 		pr := base
 		pr.CreatedAt = "2026-06-01T10:00:00Z"
 		pr.MergedAt = "2026-06-01T15:00:00Z"
-		evs := prEvents(pr, "2026-05-11")
+		evs := prEvents(pr, "2026-05-11", "")
 		if len(evs) != 1 || evs[0].date != "20260601" {
 			t.Fatalf("got %+v", evs)
 		}
@@ -48,7 +49,7 @@ func TestPREvents(t *testing.T) {
 		pr := base
 		pr.CreatedAt = "2026-06-01T10:00:00Z"
 		pr.MergedAt = "2026-06-03T15:00:00Z"
-		evs := prEvents(pr, "2026-05-11")
+		evs := prEvents(pr, "2026-05-11", "")
 		if len(evs) != 2 || evs[0].date != "20260601" || evs[1].date != "20260603" {
 			t.Fatalf("got %+v", evs)
 		}
@@ -58,7 +59,7 @@ func TestPREvents(t *testing.T) {
 		pr := base
 		pr.CreatedAt = "2026-05-01T10:00:00Z"
 		pr.MergedAt = "2026-06-03T15:00:00Z"
-		evs := prEvents(pr, "2026-05-11")
+		evs := prEvents(pr, "2026-05-11", "")
 		if len(evs) != 1 || evs[0].date != "20260603" {
 			t.Fatalf("got %+v", evs)
 		}
@@ -69,7 +70,7 @@ func TestPREvents(t *testing.T) {
 		pr.State = "CLOSED"
 		pr.CreatedAt = "2026-06-01T10:00:00Z"
 		pr.ClosedAt = "2026-06-01T12:00:00Z"
-		evs := prEvents(pr, "2026-05-11")
+		evs := prEvents(pr, "2026-05-11", "")
 		if len(evs) != 1 {
 			t.Fatalf("got %+v", evs)
 		}
@@ -83,7 +84,7 @@ func TestPREvents(t *testing.T) {
 		pr := base
 		pr.State = "OPEN"
 		pr.CreatedAt = "2026-06-01T10:00:00Z"
-		evs := prEvents(pr, "2026-05-11")
+		evs := prEvents(pr, "2026-05-11", "")
 		if len(evs) != 1 || evs[0].date != "20260601" {
 			t.Fatalf("got %+v", evs)
 		}
@@ -222,3 +223,121 @@ func TestRenderSection(t *testing.T) {
 		t.Errorf("empty section = %q", got)
 	}
 }
+
+func TestPREventsLinksAndFlags(t *testing.T) {
+	pr := ghPR{Number: 7, Title: "fix login", State: "MERGED",
+		HeadRefName: "fix-login", BaseRefName: "qa", Additions: 10, Deletions: 2,
+		CreatedAt: "2026-06-01T10:00:00Z", MergedAt: "2026-06-03T15:00:00Z"}
+	evs := prEvents(pr, "2026-05-11", "https://github.com/o/r")
+	if len(evs) != 2 {
+		t.Fatalf("got %+v", evs)
+	}
+	wantOpen := "- [#7](https://github.com/o/r/pull/7) opened: fix login (qa <- fix-login) (+10 -2)"
+	if evs[0].line != wantOpen {
+		t.Errorf("open line = %q", evs[0].line)
+	}
+	if !evs[0].opened || evs[0].merged {
+		t.Errorf("open flags = %+v", evs[0])
+	}
+	if evs[1].opened || !evs[1].merged {
+		t.Errorf("merge flags = %+v", evs[1])
+	}
+}
+
+func TestLinkHash(t *testing.T) {
+	if got := linkHash("", "abc123"); got != "#abc123" {
+		t.Errorf("plain = %q", got)
+	}
+	if got := linkHash("https://github.com/o/r", "abc123"); got != "[#abc123](https://github.com/o/r/commit/abc123)" {
+		t.Errorf("linked = %q", got)
+	}
+}
+
+func TestWeekStatLine(t *testing.T) {
+	ws := &weekStat{commits: 23, add: 2134, del: 812, opened: 1, merged: 5}
+	want := "stats: 23 commits (+2134 -812), 1 PR opened, 5 merged"
+	if got := ws.line(); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestFetchSince(t *testing.T) {
+	first := parseDate("20260511")
+	now := parseDate("20260706") // a Monday
+	fmtd := func(tm time.Time) string { return tm.Format(dateLayout) }
+
+	// -all wins regardless of files.
+	if got := fetchSince([]string{"20260629-20260703.md"}, first, true, now); fmtd(got) != "20260511" {
+		t.Errorf("all = %s", fmtd(got))
+	}
+	// No files yet: full backfill.
+	if got := fetchSince(nil, first, false, now); fmtd(got) != "20260511" {
+		t.Errorf("fresh = %s", fmtd(got))
+	}
+	// Up-to-date files: previous week's Monday.
+	if got := fetchSince([]string{"20260629-20260703.md", "20260706-20260710.md"}, first, false, now); fmtd(got) != "20260629" {
+		t.Errorf("recent = %s", fmtd(got))
+	}
+	// Gap since last run: window extends back to newest file's week.
+	if got := fetchSince([]string{"20260601-20260605.md"}, first, false, now); fmtd(got) != "20260601" {
+		t.Errorf("gap = %s", fmtd(got))
+	}
+	// Never earlier than the first week.
+	if got := fetchSince([]string{"20260504-20260508.md"}, first, false, now); fmtd(got) != "20260511" {
+		t.Errorf("clamp = %s", fmtd(got))
+	}
+}
+
+func TestWeekStatFromFile(t *testing.T) {
+	content := `# 20260601-20260605 (Week 4)
+
+<!-- daily-auto:start week 20260601 -->
+stats: 23 commits (+2134 -812), 3 PRs opened, 5 merged
+<!-- daily-auto:end week 20260601 -->
+
+intro
+`
+	if got := weekStatFromFile(content); got != "23 commits (+2134 -812), 3 PRs opened, 5 merged" {
+		t.Errorf("got %q", got)
+	}
+	if got := weekStatFromFile("# old file\n\n## Mon - 20260601\n"); got != "" {
+		t.Errorf("old-format file should have no stats, got %q", got)
+	}
+}
+
+func TestRenderWeekBlocks(t *testing.T) {
+	cfg := &Config{FirstWeekStart: "20260511", PreferredBranches: []string{"qa"},
+		Projects: []Project{{Name: "ULC"}}}
+	monday := parseDate("20260601")
+	first := parseDate("20260511")
+	days := map[string]bool{"20260601": true}
+	sections := map[string]*section{"20260601|ULC": {
+		tally:   map[string]int{"qa": 1},
+		commits: []string{"- [#abc](u/commit/abc) fix (+1 -0)"},
+	}}
+	genDays := map[string]map[string]bool{"20260601": {"ULC": true}}
+	dayTimes := map[string]*timeSpan{"20260601": {min: "10:32", max: "17:45"}}
+
+	got := renderWeek(monday, first, cfg, days, sections, genDays,
+		map[string]string{}, "", "stats: 1 commit (+1 -0), 0 PRs opened, 0 merged", dayTimes)
+
+	for _, want := range []string{
+		"# 20260601-20260605 (Week 4)",
+		"<!-- daily-auto:start week 20260601 -->\nstats: 1 commit (+1 -0), 0 PRs opened, 0 merged\n<!-- daily-auto:end week 20260601 -->",
+		"<!-- daily-auto:start day 20260601 -->\n(commit activity 10:32 - 17:45)\n<!-- daily-auto:end day 20260601 -->",
+		"- [#abc](u/commit/abc) fix (+1 -0)",
+	} {
+		if !contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+
+	// No stats / no dayTimes: neither block appears.
+	bare := renderWeek(monday, first, cfg, days, sections, genDays,
+		map[string]string{}, "", "", map[string]*timeSpan{})
+	if contains(bare, "daily-auto:start week") || contains(bare, "daily-auto:start day") {
+		t.Errorf("unexpected auto blocks:\n%s", bare)
+	}
+}
+
+func contains(s, sub string) bool { return strings.Contains(s, sub) }

@@ -1,12 +1,18 @@
 // daily-gen generates weekly work-log markdown files from git + GitHub history.
 //
-// Usage: daily-gen [-n] [config.json]
+// Usage: daily-gen [-n] [-all] [config.json]
 //
 // It reads config.json (projects, author identities, first-week anchor), walks
 // each project's git history for the configured authors, pulls your PRs via the
 // gh CLI, groups everything by ISO week and weekday, and writes one markdown
-// file per week (e.g. 20260601-20260605.md). Projects are collected in
-// parallel. -n reports which files would change without writing.
+// file per week (e.g. 20260601-20260605.md) plus an INDEX.md summary table.
+// Projects are collected in parallel.
+//
+// By default only recent weeks are fetched and re-rendered: from the Monday of
+// the previous week, extended back to the newest week file on disk so gaps
+// from skipped runs are backfilled. Older files are left untouched. -all
+// refetches and re-renders everything since firstWeekStart. -n reports which
+// files would change without writing.
 //
 // Auto-generated content lives inside <!-- daily-auto:start ... --> /
 // <!-- daily-auto:end ... --> marker blocks. Anything you write outside those
@@ -55,6 +61,7 @@ const dateLayout = "20060102"
 type commit struct {
 	hash     string
 	dateStr  string // YYYYMMDD
+	hhmm     string // HH:MM author time, feeds the day activity span
 	isMerge  bool
 	subject  string
 	add, del int
@@ -84,14 +91,39 @@ type section struct {
 // projectData is everything collected for one project, gathered concurrently.
 type projectData struct {
 	name     string
+	repoURL  string // https://github.com/owner/repo, "" if no GitHub remote
 	commits  []commit
 	prEvents []prEvent
 	warns    []string
 	err      error
 }
 
+// timeSpan is the first/last commit time of a day ("HH:MM", lexically ordered).
+type timeSpan struct {
+	min, max string
+}
+
+// weekStat accumulates the weekly summary line.
+type weekStat struct {
+	commits, add, del int
+	opened, merged    int
+}
+
+func (w *weekStat) line() string {
+	return fmt.Sprintf("stats: %s (+%d -%d), %s opened, %d merged",
+		plural(w.commits, "commit"), w.add, w.del, plural(w.opened, "PR"), w.merged)
+}
+
+func plural(n int, word string) string {
+	if n == 1 {
+		return "1 " + word
+	}
+	return fmt.Sprintf("%d %ss", n, word)
+}
+
 func main() {
 	dryRun := flag.Bool("n", false, "dry run: report files that would change without writing")
+	all := flag.Bool("all", false, "refetch and re-render every week since firstWeekStart")
 	flag.Parse()
 	cfgPath := "config.json"
 	if flag.NArg() > 0 {
@@ -106,7 +138,9 @@ func main() {
 	if err != nil {
 		fail(fmt.Errorf("bad firstWeekStart %q: %w", cfg.FirstWeekStart, err))
 	}
-	since := firstMonday.Format("2006-01-02") // git --since + PR-event lower bound
+	outDir := resolve(baseDir, cfg.OutputDir)
+	sinceMonday := fetchSince(listWeekFiles(outDir), firstMonday, *all, time.Now())
+	since := sinceMonday.Format("2006-01-02") // git --since + PR-event lower bound
 
 	results := make([]projectData, len(cfg.Projects))
 	var wg sync.WaitGroup
@@ -119,7 +153,20 @@ func main() {
 
 	sections := map[string]*section{}       // "20260601|ULC" -> section
 	genDays := map[string]map[string]bool{} // "20260601" -> set of projects with activity
+	dayTimes := map[string]*timeSpan{}      // "20260601" -> commit activity span
+	weekStats := map[string]*weekStat{}     // monday(YYYYMMDD) -> weekly totals
 
+	week := func(date string) *weekStat {
+		mon, err := weekMonday(parseDate(date))
+		if err != nil {
+			return &weekStat{} // generated dates are always valid; discard if not
+		}
+		mk := mon.Format(dateLayout)
+		if weekStats[mk] == nil {
+			weekStats[mk] = &weekStat{}
+		}
+		return weekStats[mk]
+	}
 	cell := func(date, proj string) *section {
 		key := date + "|" + proj
 		s := sections[key]
@@ -147,14 +194,33 @@ func main() {
 				continue
 			}
 			sec := cell(c.dateStr, r.name)
-			sec.commits = append(sec.commits, "- #"+c.hash+" "+c.subject+" "+statStr(c.add, c.del))
+			sec.commits = append(sec.commits, "- "+linkHash(r.repoURL, c.hash)+" "+c.subject+" "+statStr(c.add, c.del))
 			for _, b := range c.branches {
 				sec.tally[b]++
+			}
+			ws := week(c.dateStr)
+			ws.commits++
+			ws.add += c.add
+			ws.del += c.del
+			if c.hhmm != "" {
+				if ts := dayTimes[c.dateStr]; ts == nil {
+					dayTimes[c.dateStr] = &timeSpan{c.hhmm, c.hhmm}
+				} else {
+					ts.min = min(ts.min, c.hhmm)
+					ts.max = max(ts.max, c.hhmm)
+				}
 			}
 		}
 		for _, ev := range r.prEvents {
 			sec := cell(ev.date, r.name)
 			sec.prs = append(sec.prs, ev.line)
+			ws := week(ev.date)
+			if ev.opened {
+				ws.opened++
+			}
+			if ev.merged {
+				ws.merged++
+			}
 		}
 	}
 	for _, sec := range sections {
@@ -162,7 +228,6 @@ func main() {
 	}
 
 	// Parse existing week files to recover manual notes + week intros.
-	outDir := resolve(baseDir, cfg.OutputDir)
 	manualNotes := map[string]string{} // "date|project" ("" project = day-level)
 	weekIntros := map[string]string{}  // monday(YYYYMMDD) -> intro text
 	if err := parseExistingFiles(outDir, manualNotes, weekIntros); err != nil {
@@ -194,10 +259,18 @@ func main() {
 			fail(err)
 		}
 	}
+	sinceMK := sinceMonday.Format(dateLayout)
 	written, unchanged := 0, 0
 	for mk, days := range weekDays {
+		if !*all && mk < sinceMK {
+			continue // outside the fetch window: data is partial, leave the file alone
+		}
 		monday := parseDate(mk)
-		content := renderWeek(monday, firstMonday, cfg, days, sections, genDays, manualNotes, weekIntros[mk])
+		var stat string
+		if ws := weekStats[mk]; ws != nil {
+			stat = ws.line()
+		}
+		content := renderWeek(monday, firstMonday, cfg, days, sections, genDays, manualNotes, weekIntros[mk], stat, dayTimes)
 		path := filepath.Join(outDir, weekFilename(monday))
 		old, _ := os.ReadFile(path)
 		if string(old) == content {
@@ -214,11 +287,70 @@ func main() {
 		}
 		written++
 	}
+	// INDEX.md summary table, rebuilt from the week files on disk. In a dry
+	// run the week files were not rewritten, so this reflects pre-run state.
+	if idx := renderIndex(outDir, firstMonday); idx != "" {
+		path := filepath.Join(outDir, "INDEX.md")
+		old, _ := os.ReadFile(path)
+		if string(old) != idx {
+			if *dryRun {
+				fmt.Println("would update INDEX.md")
+			} else {
+				if err := writeFileAtomic(path, []byte(idx)); err != nil {
+					fail(fmt.Errorf("write INDEX.md: %w", err))
+				}
+				fmt.Println("updated INDEX.md")
+			}
+		}
+	}
+
 	if *dryRun {
 		fmt.Printf("done (dry run): %d would change, %d unchanged\n", written, unchanged)
 	} else {
 		fmt.Printf("done: %d written, %d unchanged\n", written, unchanged)
 	}
+}
+
+// fetchSince picks the fetch/re-render window start given the week files
+// already on disk. Default: the previous week's Monday, extended back to the
+// newest week file so gaps from skipped runs are backfilled; a fresh output
+// dir (or -all) fetches everything since firstMonday.
+func fetchSince(weekFiles []string, firstMonday time.Time, all bool, now time.Time) time.Time {
+	if all || len(weekFiles) == 0 {
+		return firstMonday
+	}
+	newest := time.Time{}
+	for _, name := range weekFiles {
+		if d := parseDate(name[:8]); d.After(newest) {
+			newest = d
+		}
+	}
+	today := parseDate(now.Format(dateLayout))
+	mon, _ := weekMonday(today) // today is never zero
+	start := mon.AddDate(0, 0, -7)
+	if newest.Before(start) {
+		start = newest
+	}
+	if start.Before(firstMonday) {
+		start = firstMonday
+	}
+	return start
+}
+
+// listWeekFiles returns the YYYYMMDD-YYYYMMDD.md filenames in outDir, sorted.
+func listWeekFiles(outDir string) []string {
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && reFilename.MatchString(e.Name()) {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // collectProject gathers commits and PR events for one project. Only a failing
@@ -228,11 +360,14 @@ func collectProject(p Project, baseDir string, authors []string, ghAuthor, since
 	d := projectData{name: p.Name}
 	projPath := resolve(baseDir, p.Path)
 
-	branches, err := branchMap(projPath, authors, since)
+	// A bare date in git --since means "that date at the current time of day"
+	// (approxidate), which silently drops the window day's earlier commits.
+	gitSince := since + "T00:00:00"
+	branches, err := branchMap(projPath, authors, gitSince)
 	if err != nil {
 		d.warns = append(d.warns, fmt.Sprintf("%s: branch lookup failed, branch guesses degraded: %v", p.Name, err))
 	}
-	d.commits, err = gitLog(projPath, authors, since, branches)
+	d.commits, err = gitLog(projPath, authors, gitSince, branches)
 	if err != nil {
 		d.err = fmt.Errorf("git log %s: %w", p.Name, err)
 		return d
@@ -244,6 +379,7 @@ func collectProject(p Project, baseDir string, authors []string, ghAuthor, since
 		d.warns = append(d.warns, fmt.Sprintf("%s: no github remote, skipping PRs: %v", p.Name, err))
 		return d
 	}
+	d.repoURL = "https://github.com/" + repo
 	prs, err := ghPRList(repo, ghAuthor, since)
 	if err != nil {
 		d.warns = append(d.warns, fmt.Sprintf("%s: gh pr list failed, skipping PRs: %v", p.Name, err))
@@ -253,7 +389,7 @@ func collectProject(p Project, baseDir string, authors []string, ghAuthor, since
 		d.warns = append(d.warns, fmt.Sprintf("%s: gh returned exactly %d PRs, results may be truncated", p.Name, ghPRLimit))
 	}
 	for _, pr := range prs {
-		d.prEvents = append(d.prEvents, prEvents(pr, since)...)
+		d.prEvents = append(d.prEvents, prEvents(pr, since, d.repoURL)...)
 	}
 	return d
 }
@@ -285,7 +421,7 @@ const fieldSep = "\x1f"
 func gitLog(projPath string, authors []string, since string, branches map[string][]string) ([]commit, error) {
 	args := []string{
 		"log", "--branches", "--remotes", "--no-color", "--numstat",
-		"--date=format:%Y-%m-%d",
+		"--date=format:%Y-%m-%d %H:%M",
 		"--pretty=format:%h" + fieldSep + "%ad" + fieldSep + "%P" + fieldSep + "%s",
 		"--since=" + since,
 	}
@@ -311,7 +447,7 @@ func gitLog(projPath string, authors []string, since string, branches map[string
 				cur = nil
 				continue
 			}
-			t, err := time.Parse("2006-01-02", parts[1])
+			t, err := time.Parse("2006-01-02 15:04", parts[1])
 			if err != nil {
 				cur = nil
 				continue
@@ -319,6 +455,7 @@ func gitLog(projPath string, authors []string, since string, branches map[string
 			cur = &commit{
 				hash:     parts[0],
 				dateStr:  t.Format(dateLayout),
+				hhmm:     t.Format("15:04"),
 				isMerge:  len(strings.Fields(parts[2])) > 1,
 				subject:  parts[3],
 				branches: branches[parts[0]],
@@ -468,47 +605,67 @@ func ghPRList(repo, author, sinceISO string) ([]ghPR, error) {
 }
 
 type prEvent struct {
-	date string // YYYYMMDD
-	line string
+	date           string // YYYYMMDD
+	line           string
+	opened, merged bool // feed the weekly stats line
 }
 
 // prEvents expands a PR into dated "- #N <verb>: ..." log lines. Same-day
 // open+close collapse into one line; otherwise opened and merged/closed land on
 // their own days. Events before minISO (YYYY-MM-DD) are dropped.
-func prEvents(pr ghPR, minISO string) []prEvent {
+func prEvents(pr ghPR, minISO, repoURL string) []prEvent {
 	suffix := fmt.Sprintf("%s (%s <- %s) %s", pr.Title, pr.BaseRefName, pr.HeadRefName, statStr(pr.Additions, pr.Deletions))
 	open := iso10(pr.CreatedAt)
 	bullet := func(verb string) string {
-		return fmt.Sprintf("- #%d %s: %s", pr.Number, verb, suffix)
+		return fmt.Sprintf("- %s %s: %s", linkPR(repoURL, pr.Number), verb, suffix)
 	}
 	var out []prEvent
-	add := func(isoDate, verb string) {
+	add := func(isoDate, verb string, opened, merged bool) {
 		if isoDate == "" || isoDate < minISO {
 			return
 		}
-		out = append(out, prEvent{date: strings.ReplaceAll(isoDate, "-", ""), line: bullet(verb)})
+		out = append(out, prEvent{
+			date: strings.ReplaceAll(isoDate, "-", ""), line: bullet(verb),
+			opened: opened, merged: merged,
+		})
 	}
 	switch pr.State {
 	case "MERGED":
 		m := iso10(pr.MergedAt)
 		if m == open {
-			add(open, "opened & merged")
+			add(open, "opened & merged", true, true)
 		} else {
-			add(open, "opened")
-			add(m, "merged")
+			add(open, "opened", true, false)
+			add(m, "merged", false, true)
 		}
 	case "CLOSED":
 		c := iso10(pr.ClosedAt)
 		if c == open {
-			add(open, "opened & closed (unmerged)")
+			add(open, "opened & closed (unmerged)", true, false)
 		} else {
-			add(open, "opened")
-			add(c, "closed (unmerged)")
+			add(open, "opened", true, false)
+			add(c, "closed (unmerged)", false, false)
 		}
 	default: // OPEN
-		add(open, "opened")
+		add(open, "opened", true, false)
 	}
 	return out
+}
+
+// linkPR / linkHash render the "#x" token, hyperlinked when the project has a
+// GitHub remote.
+func linkPR(repoURL string, num int) string {
+	if repoURL == "" {
+		return fmt.Sprintf("#%d", num)
+	}
+	return fmt.Sprintf("[#%d](%s/pull/%d)", num, repoURL, num)
+}
+
+func linkHash(repoURL, hash string) string {
+	if repoURL == "" {
+		return "#" + hash
+	}
+	return fmt.Sprintf("[#%s](%s/commit/%s)", hash, repoURL, hash)
 }
 
 func iso10(s string) string {
@@ -535,12 +692,15 @@ func sortPRLines(lines []string) {
 
 func renderWeek(monday, firstMonday time.Time, cfg *Config, days map[string]bool,
 	sections map[string]*section, genDays map[string]map[string]bool,
-	manualNotes map[string]string, intro string) string {
+	manualNotes map[string]string, intro, stat string, dayTimes map[string]*timeSpan) string {
 
 	var b strings.Builder
-	weekNum := int(math.Round(monday.Sub(firstMonday).Hours()/24/7)) + 1
+	mk := monday.Format(dateLayout)
 	friday := monday.AddDate(0, 0, 4)
-	fmt.Fprintf(&b, "# %s-%s (Week %d)\n\n", monday.Format(dateLayout), friday.Format(dateLayout), weekNum)
+	fmt.Fprintf(&b, "# %s-%s (Week %d)\n\n", mk, friday.Format(dateLayout), weekNumber(monday, firstMonday))
+	if stat != "" {
+		fmt.Fprintf(&b, "<!-- daily-auto:start week %s -->\n%s\n<!-- daily-auto:end week %s -->\n\n", mk, stat, mk)
+	}
 
 	// "first week" note only on the anchor week, unless you've written your own.
 	if intro == "" && monday.Equal(firstMonday) {
@@ -554,6 +714,13 @@ func renderWeek(monday, firstMonday time.Time, cfg *Config, days map[string]bool
 	for _, d := range sortedKeys(days) {
 		dt := parseDate(d)
 		fmt.Fprintf(&b, "## %s - %s\n\n", dt.Weekday().String()[:3], d)
+		if ts := dayTimes[d]; ts != nil {
+			span := ts.min
+			if ts.max != ts.min {
+				span += " - " + ts.max
+			}
+			fmt.Fprintf(&b, "<!-- daily-auto:start day %s -->\n(commit activity %s)\n<!-- daily-auto:end day %s -->\n\n", d, span, d)
+		}
 		if note := manualNotes[d+"|"]; note != "" {
 			b.WriteString(note)
 			b.WriteString("\n\n")
@@ -598,6 +765,54 @@ func renderSection(sec *section, preferred []string) string {
 		lines = append(lines, "(no recorded activity)")
 	}
 	return strings.Join(lines, "\n") + "\n"
+}
+
+func weekNumber(monday, firstMonday time.Time) int {
+	return int(math.Round(monday.Sub(firstMonday).Hours()/24/7)) + 1
+}
+
+// renderIndex builds the INDEX.md summary table from the week files on disk,
+// one row per week with the stats line pulled from its week auto block.
+// Returns "" when there are no week files.
+func renderIndex(outDir string, firstMonday time.Time) string {
+	names := listWeekFiles(outDir)
+	if len(names) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("# Index\n\n<!-- generated by daily-gen, do not edit -->\n\n")
+	b.WriteString("| Week | File | Stats |\n| --- | --- | --- |\n")
+	for _, n := range names {
+		data, err := os.ReadFile(filepath.Join(outDir, n))
+		if err != nil {
+			continue
+		}
+		monday := parseDate(n[:8])
+		fmt.Fprintf(&b, "| %d | [%s - %s](%s) | %s |\n",
+			weekNumber(monday, firstMonday), n[:8], n[9:17], n, weekStatFromFile(string(data)))
+	}
+	return b.String()
+}
+
+// weekStatFromFile extracts the stats text from a week file's week-level auto
+// block ("" for files that predate stats).
+func weekStatFromFile(content string) string {
+	in := false
+	for line := range strings.SplitSeq(content, "\n") {
+		if strings.HasPrefix(line, "<!-- daily-auto:start week") {
+			in = true
+			continue
+		}
+		if in {
+			if s, ok := strings.CutPrefix(line, "stats: "); ok {
+				return s
+			}
+			if strings.HasPrefix(line, "<!--") {
+				return ""
+			}
+		}
+	}
+	return ""
 }
 
 func orderedProjects(date string, cfg *Config, genDays map[string]map[string]bool, manualNotes map[string]string) []string {
