@@ -341,3 +341,24 @@ func TestRenderWeekBlocks(t *testing.T) {
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+func TestParseGitLog(t *testing.T) {
+	sep := fieldSep
+	out := strings.Join([]string{
+		"abc1234" + sep + "2026-07-06 10:41" + sep + "deadbee" + sep + "jk8607@nyu.edu" + sep + "fix: real work",
+		"3\t1\tsrc/foo.ts",
+		"",
+		// GitHub-generated squash merge: committer is noreply@github.com,
+		// author date is the merge time in whatever tz GitHub picked.
+		"a1e7a50" + sep + "2026-07-06 06:27" + sep + "deadbef" + sep + "noreply@github.com" + sep + "Promoting QA to Production (#78)",
+		"69278\t16265\tlots/of/files.ts",
+	}, "\n")
+	got := parseGitLog([]byte(out), map[string][]string{"abc1234": {"qa"}})
+	want := []commit{{
+		hash: "abc1234", dateStr: "20260706", hhmm: "10:41",
+		subject: "fix: real work", add: 3, del: 1, branches: []string{"qa"},
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("parseGitLog = %+v, want %+v", got, want)
+	}
+}
