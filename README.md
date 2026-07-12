@@ -1,6 +1,6 @@
 # daily-gen
 
-Generates weekly work-log markdown (`YYYYMMDD-YYYYMMDD.md`, Mon–Fri) from git
+Generates weekly work-log markdown (`YYYYMMDD-YYYYMMDD.md`, Mon–Sun) from git
 history across configured projects, filtered to your author identities.
 
 ## Usage
@@ -15,6 +15,9 @@ go run . -all         # refetch and re-render every week since firstWeekStart
 
 Output lands in `outputDir` (default `..`, i.e. the `daily/` folder), plus an
 auto-generated `INDEX.md` summary table. Projects are collected in parallel.
+Files created by older versions used a Mon–Fri name even when they contained
+weekend activity; affected files are migrated to the accurate Mon–Sun name the
+next time that week is rendered.
 
 By default only **recent weeks** are fetched and re-rendered: from the previous
 week's Monday, extended back to the newest week file on disk (so gaps from

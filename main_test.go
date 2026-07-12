@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -267,7 +269,7 @@ func TestFetchSince(t *testing.T) {
 	fmtd := func(tm time.Time) string { return tm.Format(dateLayout) }
 
 	// -all wins regardless of files.
-	if got := fetchSince([]string{"20260629-20260703.md"}, first, true, now); fmtd(got) != "20260511" {
+	if got := fetchSince([]string{"20260629-20260705.md"}, first, true, now); fmtd(got) != "20260511" {
 		t.Errorf("all = %s", fmtd(got))
 	}
 	// No files yet: full backfill.
@@ -275,16 +277,33 @@ func TestFetchSince(t *testing.T) {
 		t.Errorf("fresh = %s", fmtd(got))
 	}
 	// Up-to-date files: previous week's Monday.
-	if got := fetchSince([]string{"20260629-20260703.md", "20260706-20260710.md"}, first, false, now); fmtd(got) != "20260629" {
+	if got := fetchSince([]string{"20260629-20260703.md", "20260706-20260712.md"}, first, false, now); fmtd(got) != "20260629" {
 		t.Errorf("recent = %s", fmtd(got))
 	}
 	// Gap since last run: window extends back to newest file's week.
-	if got := fetchSince([]string{"20260601-20260605.md"}, first, false, now); fmtd(got) != "20260601" {
+	if got := fetchSince([]string{"20260601-20260607.md"}, first, false, now); fmtd(got) != "20260601" {
 		t.Errorf("gap = %s", fmtd(got))
 	}
 	// Never earlier than the first week.
-	if got := fetchSince([]string{"20260504-20260508.md"}, first, false, now); fmtd(got) != "20260511" {
+	if got := fetchSince([]string{"20260504-20260510.md"}, first, false, now); fmtd(got) != "20260511" {
 		t.Errorf("clamp = %s", fmtd(got))
+	}
+}
+
+func TestListWeekFilesPrefersCanonicalName(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{
+		"20260629-20260703.md", // legacy Mon-Fri
+		"20260629-20260705.md", // canonical Mon-Sun
+		"20260706-20260710.md", // legacy-only week remains readable
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{"20260629-20260705.md", "20260706-20260710.md"}
+	if got := listWeekFiles(dir); !reflect.DeepEqual(got, want) {
+		t.Errorf("listWeekFiles = %v, want %v", got, want)
 	}
 }
 
@@ -322,7 +341,7 @@ func TestRenderWeekBlocks(t *testing.T) {
 		map[string]string{}, "", "stats: 1 commit (+1 -0), 0 PRs opened, 0 merged", dayTimes)
 
 	for _, want := range []string{
-		"# 20260601-20260605 (Week 4)",
+		"# 20260601-20260607 (Week 4)",
 		"<!-- daily-auto:start week 20260601 -->\nstats: 1 commit (+1 -0), 0 PRs opened, 0 merged\n<!-- daily-auto:end week 20260601 -->",
 		"<!-- daily-auto:start day 20260601 -->\n(commit activity 10:32 - 17:45)\n<!-- daily-auto:end day 20260601 -->",
 		"- [#abc](u/commit/abc) fix (+1 -0)",
@@ -337,6 +356,37 @@ func TestRenderWeekBlocks(t *testing.T) {
 		map[string]string{}, "", "", map[string]*timeSpan{})
 	if contains(bare, "daily-auto:start week") || contains(bare, "daily-auto:start day") {
 		t.Errorf("unexpected auto blocks:\n%s", bare)
+	}
+}
+
+func TestRenderWeekIncludesWeekend(t *testing.T) {
+	cfg := &Config{FirstWeekStart: "20260511", Projects: []Project{{Name: "Apps Manager"}}}
+	monday := parseDate("20260706")
+	days := map[string]bool{"20260711": true, "20260712": true}
+	sections := map[string]*section{
+		"20260711|Apps Manager": {tally: map[string]int{"qa": 1}, commits: []string{"- #sat Saturday work (+1 -0)"}},
+		"20260712|Apps Manager": {tally: map[string]int{"qa": 1}, commits: []string{"- #sun Sunday work (+1 -0)"}},
+	}
+	genDays := map[string]map[string]bool{
+		"20260711": {"Apps Manager": true},
+		"20260712": {"Apps Manager": true},
+	}
+
+	got := renderWeek(monday, parseDate("20260511"), cfg, days, sections, genDays,
+		map[string]string{}, "", "", map[string]*timeSpan{})
+	for _, want := range []string{
+		"# 20260706-20260712",
+		"## Sat - 20260711",
+		"- #sat Saturday work (+1 -0)",
+		"## Sun - 20260712",
+		"- #sun Sunday work (+1 -0)",
+	} {
+		if !contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	if got := weekFilename(monday); got != "20260706-20260712.md" {
+		t.Errorf("weekFilename = %q", got)
 	}
 }
 
