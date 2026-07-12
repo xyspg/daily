@@ -5,7 +5,7 @@
 // It reads config.json (projects, author identities, first-week anchor), walks
 // each project's git history for the configured authors, pulls your PRs via the
 // gh CLI, groups everything by ISO week and weekday, and writes one markdown
-// file per week (e.g. 20260601-20260605.md) plus an INDEX.md summary table.
+// file per week (e.g. 20260601-20260607.md) plus an INDEX.md summary table.
 // Projects are collected in parallel.
 //
 // By default only recent weeks are fetched and re-rendered: from the Monday of
@@ -274,18 +274,38 @@ func main() {
 		}
 		content := renderWeek(monday, firstMonday, cfg, days, sections, genDays, manualNotes, weekIntros[mk], stat, dayTimes)
 		path := filepath.Join(outDir, weekFilename(monday))
+		legacyPath := filepath.Join(outDir, legacyWeekFilename(monday))
 		old, _ := os.ReadFile(path)
-		if string(old) == content {
+		_, legacyErr := os.Stat(legacyPath)
+		hasLegacy := legacyPath != path && legacyErr == nil
+		needsWrite := string(old) != content
+		if !needsWrite && !hasLegacy {
 			unchanged++
 			continue
 		}
 		if *dryRun {
-			fmt.Printf("would update %s\n", filepath.Base(path))
-		} else {
-			if err := writeFileAtomic(path, []byte(content)); err != nil {
-				fail(fmt.Errorf("write %s: %w", path, err))
+			if needsWrite {
+				fmt.Printf("would update %s\n", filepath.Base(path))
 			}
-			fmt.Printf("updated %s\n", filepath.Base(path))
+			if hasLegacy {
+				fmt.Printf("would remove legacy %s\n", filepath.Base(legacyPath))
+			}
+		} else {
+			if needsWrite {
+				if err := writeFileAtomic(path, []byte(content)); err != nil {
+					fail(fmt.Errorf("write %s: %w", path, err))
+				}
+				fmt.Printf("updated %s\n", filepath.Base(path))
+			}
+			// Pre-fix week files ended on Friday even though their contents could
+			// include Saturday and Sunday. Remove the old name only after the
+			// canonical Mon-Sun file has been written successfully.
+			if hasLegacy {
+				if err := os.Remove(legacyPath); err != nil {
+					fail(fmt.Errorf("remove legacy %s: %w", legacyPath, err))
+				}
+				fmt.Printf("removed legacy %s\n", filepath.Base(legacyPath))
+			}
 		}
 		written++
 	}
@@ -339,17 +359,28 @@ func fetchSince(weekFiles []string, firstMonday time.Time, all bool, now time.Ti
 	return start
 }
 
-// listWeekFiles returns the YYYYMMDD-YYYYMMDD.md filenames in outDir, sorted.
+// listWeekFiles returns one YYYYMMDD-YYYYMMDD.md filename per week, sorted.
+// During migration, prefer the canonical Mon-Sun name when both it and the
+// legacy Mon-Fri name exist.
 func listWeekFiles(outDir string) []string {
 	entries, err := os.ReadDir(outDir)
 	if err != nil {
 		return nil
 	}
-	var names []string
+	byMonday := map[string]string{}
 	for _, e := range entries {
 		if !e.IsDir() && reFilename.MatchString(e.Name()) {
-			names = append(names, e.Name())
+			name := e.Name()
+			mk := name[:8]
+			canonical := weekFilename(parseDate(mk))
+			if byMonday[mk] == "" || name == canonical {
+				byMonday[mk] = name
+			}
 		}
+	}
+	var names []string
+	for _, name := range byMonday {
+		names = append(names, name)
 	}
 	sort.Strings(names)
 	return names
@@ -715,8 +746,8 @@ func renderWeek(monday, firstMonday time.Time, cfg *Config, days map[string]bool
 
 	var b strings.Builder
 	mk := monday.Format(dateLayout)
-	friday := monday.AddDate(0, 0, 4)
-	fmt.Fprintf(&b, "# %s-%s (Week %d)\n\n", mk, friday.Format(dateLayout), weekNumber(monday, firstMonday))
+	sunday := monday.AddDate(0, 0, 6)
+	fmt.Fprintf(&b, "# %s-%s (Week %d)\n\n", mk, sunday.Format(dateLayout), weekNumber(monday, firstMonday))
 	if stat != "" {
 		fmt.Fprintf(&b, "<!-- daily-auto:start week %s -->\n%s\n<!-- daily-auto:end week %s -->\n\n", mk, stat, mk)
 	}
@@ -808,7 +839,7 @@ func renderIndex(outDir string, firstMonday time.Time) string {
 		}
 		monday := parseDate(n[:8])
 		fmt.Fprintf(&b, "| %d | [%s - %s](%s) | %s |\n",
-			weekNumber(monday, firstMonday), n[:8], n[9:17], n, weekStatFromFile(string(data)))
+			weekNumber(monday, firstMonday), n[:8], monday.AddDate(0, 0, 6).Format(dateLayout), n, weekStatFromFile(string(data)))
 	}
 	return b.String()
 }
@@ -865,18 +896,8 @@ var (
 )
 
 func parseExistingFiles(outDir string, manualNotes, weekIntros map[string]string) error {
-	entries, err := os.ReadDir(outDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	for _, e := range entries {
-		if e.IsDir() || !reFilename.MatchString(e.Name()) {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(outDir, e.Name()))
+	for _, name := range listWeekFiles(outDir) {
+		data, err := os.ReadFile(filepath.Join(outDir, name))
 		if err != nil {
 			return err
 		}
@@ -1006,6 +1027,10 @@ func weekMonday(t time.Time) (time.Time, error) {
 }
 
 func weekFilename(monday time.Time) string {
+	return monday.Format(dateLayout) + "-" + monday.AddDate(0, 0, 6).Format(dateLayout) + ".md"
+}
+
+func legacyWeekFilename(monday time.Time) string {
 	return monday.Format(dateLayout) + "-" + monday.AddDate(0, 0, 4).Format(dateLayout) + ".md"
 }
 
