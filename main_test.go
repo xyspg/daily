@@ -91,6 +91,29 @@ func TestPREvents(t *testing.T) {
 			t.Fatalf("got %+v", evs)
 		}
 	})
+
+	// gh reports UTC. Saturday-evening work used to surface as a Sunday that
+	// had not happened yet; both events belong to the same ET Saturday.
+	t.Run("evening UTC rollover stays on the ET day", func(t *testing.T) {
+		pr := base
+		pr.CreatedAt = "2026-07-25T23:10:00Z" // Sat 19:10 ET
+		pr.MergedAt = "2026-07-26T01:20:00Z"  // Sat 21:20 ET
+		evs := prEvents(pr, "2026-07-20", "")
+		if len(evs) != 1 || evs[0].date != "20260725" {
+			t.Fatalf("got %+v, want a single 20260725 event", evs)
+		}
+	})
+
+	// The cutoff is an ET date too: an event at ET 23:00 Sunday reads as UTC
+	// Monday, and must not be pulled into the new week.
+	t.Run("cutoff compares ET dates", func(t *testing.T) {
+		pr := base
+		pr.State = "OPEN"
+		pr.CreatedAt = "2026-07-20T02:00:00Z" // Sun 22:00 ET, week before
+		if evs := prEvents(pr, "2026-07-20", ""); len(evs) != 0 {
+			t.Fatalf("got %+v, want none", evs)
+		}
+	})
 }
 
 func TestDominantBranch(t *testing.T) {
@@ -395,12 +418,12 @@ func contains(s, sub string) bool { return strings.Contains(s, sub) }
 func TestParseGitLog(t *testing.T) {
 	sep := fieldSep
 	out := strings.Join([]string{
-		"abc1234" + sep + "2026-07-06 10:41" + sep + "deadbee" + sep + "jk8607@nyu.edu" + sep + "fix: real work",
+		"abc1234" + sep + "2026-07-06T10:41:07-04:00" + sep + "deadbee" + sep + "jk8607@nyu.edu" + sep + "fix: real work",
 		"3\t1\tsrc/foo.ts",
 		"",
 		// GitHub-generated squash merge: committer is noreply@github.com,
 		// author date is the merge time in whatever tz GitHub picked.
-		"a1e7a50" + sep + "2026-07-06 06:27" + sep + "deadbef" + sep + "noreply@github.com" + sep + "Promoting QA to Production (#78)",
+		"a1e7a50" + sep + "2026-07-06T06:27:11+00:00" + sep + "deadbef" + sep + "noreply@github.com" + sep + "Promoting QA to Production (#78)",
 		"69278\t16265\tlots/of/files.ts",
 	}, "\n")
 	got := parseGitLog([]byte(out), map[string][]string{"abc1234": {"qa"}})
@@ -410,5 +433,25 @@ func TestParseGitLog(t *testing.T) {
 	}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("parseGitLog = %+v, want %+v", got, want)
+	}
+}
+
+// A commit authored elsewhere must land on the ET day it happened, not on the
+// author's local calendar day.
+func TestParseGitLogConvertsToET(t *testing.T) {
+	sep := fieldSep
+	cases := []struct {
+		authored, date, hhmm string
+	}{
+		{"2026-07-06T01:30:00+08:00", "20260705", "13:30"}, // Beijing Monday -> ET Sunday
+		{"2026-07-27T02:15:00Z", "20260726", "22:15"},      // UTC Monday -> ET Sunday night
+		{"2026-07-06T10:41:07-04:00", "20260706", "10:41"}, // already ET
+	}
+	for _, c := range cases {
+		line := "abc1234" + sep + c.authored + sep + "deadbee" + sep + "jk8607@nyu.edu" + sep + "work"
+		got := parseGitLog([]byte(line), nil)
+		if len(got) != 1 || got[0].dateStr != c.date || got[0].hhmm != c.hhmm {
+			t.Errorf("%s -> %+v, want date %s hhmm %s", c.authored, got, c.date, c.hhmm)
+		}
 	}
 }
