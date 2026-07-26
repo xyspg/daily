@@ -19,6 +19,11 @@
 // markers (prose, "(on qa branch)" tweaks, extra notes) is preserved verbatim
 // on every re-run. Running again is incremental: a week's file is only rewritten
 // when that week's derived content actually changed.
+//
+// Every date and time in the output is Eastern Time, regardless of the tz the
+// commit was authored in, the tz GitHub reports (always UTC), or the tz of the
+// machine running this. The work happens in New York: an evening commit or PR
+// belongs to that workday, not to the UTC day that has already rolled over.
 package main
 
 import (
@@ -36,7 +41,39 @@ import (
 	"strings"
 	"sync"
 	"time"
+	_ "time/tzdata" // embedded tz database: don't depend on the host having one
 )
+
+// tz is the single timezone every date in the log is bucketed by.
+const tzName = "America/New_York"
+
+var et = loadET()
+
+func loadET() *time.Location {
+	loc, err := time.LoadLocation(tzName)
+	if err != nil {
+		fail(fmt.Errorf("load timezone %s: %w", tzName, err))
+	}
+	return loc
+}
+
+// etDate renders an RFC3339 timestamp as its YYYY-MM-DD in ET. GitHub stamps
+// everything in UTC, so a PR merged 21:20 ET reads 01:20Z the *next* day;
+// truncating the raw string would file it under a day that hasn't happened yet.
+func etDate(s string) string {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return ""
+	}
+	return t.In(et).Format("2006-01-02")
+}
+
+// etMidnight is 00:00 ET on the calendar day of d, for tz-explicit --since
+// bounds (git would otherwise read a bare timestamp in the machine's tz).
+func etMidnight(d time.Time) time.Time {
+	y, m, day := d.Date()
+	return time.Date(y, m, day, 0, 0, 0, 0, et)
+}
 
 // ---- config ----
 
@@ -139,14 +176,13 @@ func main() {
 		fail(fmt.Errorf("bad firstWeekStart %q: %w", cfg.FirstWeekStart, err))
 	}
 	outDir := resolve(baseDir, cfg.OutputDir)
-	sinceMonday := fetchSince(listWeekFiles(outDir), firstMonday, *all, time.Now())
-	since := sinceMonday.Format("2006-01-02") // git --since + PR-event lower bound
+	sinceMonday := fetchSince(listWeekFiles(outDir), firstMonday, *all, time.Now().In(et))
 
 	results := make([]projectData, len(cfg.Projects))
 	var wg sync.WaitGroup
 	for i, p := range cfg.Projects {
 		wg.Go(func() {
-			results[i] = collectProject(p, baseDir, cfg.Authors, cfg.GithubAuthor, since)
+			results[i] = collectProject(p, baseDir, cfg.Authors, cfg.GithubAuthor, sinceMonday)
 		})
 	}
 	wg.Wait()
@@ -336,7 +372,8 @@ func main() {
 // fetchSince picks the fetch/re-render window start given the week files
 // already on disk. Default: the previous week's Monday, extended back to the
 // newest week file so gaps from skipped runs are backfilled; a fresh output
-// dir (or -all) fetches everything since firstMonday.
+// dir (or -all) fetches everything since firstMonday. now must already be in ET
+// so "this week" flips at ET midnight.
 func fetchSince(weekFiles []string, firstMonday time.Time, all bool, now time.Time) time.Time {
 	if all || len(weekFiles) == 0 {
 		return firstMonday
@@ -389,13 +426,15 @@ func listWeekFiles(outDir string) []string {
 // collectProject gathers commits and PR events for one project. Only a failing
 // git log is fatal; missing remotes, gh failures, and branch-lookup failures
 // degrade to warnings.
-func collectProject(p Project, baseDir string, authors []string, ghAuthor, since string) projectData {
+func collectProject(p Project, baseDir string, authors []string, ghAuthor string, sinceMonday time.Time) projectData {
 	d := projectData{name: p.Name}
 	projPath := resolve(baseDir, p.Path)
 
+	since := sinceMonday.Format("2006-01-02") // gh search + PR-event lower bound
 	// A bare date in git --since means "that date at the current time of day"
-	// (approxidate), which silently drops the window day's earlier commits.
-	gitSince := since + "T00:00:00"
+	// (approxidate), which silently drops the window day's earlier commits, and
+	// a bare timestamp is read in the machine's tz. Pin it to ET midnight.
+	gitSince := etMidnight(sinceMonday).Format(time.RFC3339)
 	branches, err := branchMap(projPath, authors, gitSince)
 	if err != nil {
 		d.warns = append(d.warns, fmt.Sprintf("%s: branch lookup failed, branch guesses degraded: %v", p.Name, err))
@@ -454,11 +493,11 @@ const fieldSep = "\x1f"
 func gitLog(projPath string, authors []string, since string, branches map[string][]string) ([]commit, error) {
 	args := []string{
 		"log", "--branches", "--remotes", "--no-color", "--numstat",
-		// format-local: commits carry whatever tz they were authored in
-		// (GitHub-generated ones are especially arbitrary); normalize all
-		// timestamps to this machine's tz so day buckets and activity
-		// spans line up with the author's actual working hours.
-		"--date=format-local:%Y-%m-%d %H:%M",
+		// Commits carry whatever tz they were authored in (GitHub-generated
+		// ones are especially arbitrary). Emit the offset and convert to ET
+		// ourselves, so day buckets and activity spans line up with the
+		// author's actual working hours no matter where this runs.
+		"--date=iso-strict",
 		"--pretty=format:%h" + fieldSep + "%ad" + fieldSep + "%P" + fieldSep + "%ce" + fieldSep + "%s",
 		"--since=" + since,
 	}
@@ -497,11 +536,12 @@ func parseGitLog(out []byte, branches map[string][]string) []commit {
 				cur = nil
 				continue
 			}
-			t, err := time.Parse("2006-01-02 15:04", parts[1])
+			t, err := time.Parse(time.RFC3339, parts[1])
 			if err != nil {
 				cur = nil
 				continue
 			}
+			t = t.In(et)
 			cur = &commit{
 				hash:     parts[0],
 				dateStr:  t.Format(dateLayout),
@@ -665,7 +705,7 @@ type prEvent struct {
 // their own days. Events before minISO (YYYY-MM-DD) are dropped.
 func prEvents(pr ghPR, minISO, repoURL string) []prEvent {
 	suffix := fmt.Sprintf("%s (%s <- %s) %s", pr.Title, pr.BaseRefName, pr.HeadRefName, statStr(pr.Additions, pr.Deletions))
-	open := iso10(pr.CreatedAt)
+	open := etDate(pr.CreatedAt)
 	bullet := func(verb string) string {
 		return fmt.Sprintf("- %s %s: %s", linkPR(repoURL, pr.Number), verb, suffix)
 	}
@@ -681,7 +721,7 @@ func prEvents(pr ghPR, minISO, repoURL string) []prEvent {
 	}
 	switch pr.State {
 	case "MERGED":
-		m := iso10(pr.MergedAt)
+		m := etDate(pr.MergedAt)
 		if m == open {
 			add(open, "opened & merged", true, true)
 		} else {
@@ -689,7 +729,7 @@ func prEvents(pr ghPR, minISO, repoURL string) []prEvent {
 			add(m, "merged", false, true)
 		}
 	case "CLOSED":
-		c := iso10(pr.ClosedAt)
+		c := etDate(pr.ClosedAt)
 		if c == open {
 			add(open, "opened & closed (unmerged)", true, false)
 		} else {
@@ -716,13 +756,6 @@ func linkHash(repoURL, hash string) string {
 		return "#" + hash
 	}
 	return fmt.Sprintf("[#%s](%s/commit/%s)", hash, repoURL, hash)
-}
-
-func iso10(s string) string {
-	if len(s) >= 10 {
-		return s[:10]
-	}
-	return ""
 }
 
 var rePRNum = regexp.MustCompile(`#(\d+)`)
