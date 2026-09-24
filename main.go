@@ -88,6 +88,7 @@ type Config struct {
 	FirstWeekStart    string    `json:"firstWeekStart"` // YYYYMMDD, anchors "Week 1"
 	OutputDir         string    `json:"outputDir"`
 	PreferredBranches []string  `json:"preferredBranches"` // branch-guess tie-break order, default ["qa"]
+	PRArchiveDir      string    `json:"prArchiveDir"`      // full per-PR archive, default <outputDir>/prs, "off" disables
 	Projects          []Project `json:"projects"`
 }
 
@@ -128,7 +129,9 @@ type section struct {
 // projectData is everything collected for one project, gathered concurrently.
 type projectData struct {
 	name     string
+	repo     string // owner/repo, "" if no GitHub remote
 	repoURL  string // https://github.com/owner/repo, "" if no GitHub remote
+	prs      []ghPR // window-scoped PR list, reused by the archive
 	commits  []commit
 	prEvents []prEvent
 	warns    []string
@@ -362,6 +365,26 @@ func main() {
 		}
 	}
 
+	if cfg.PRArchiveDir != "off" {
+		root := filepath.Join(outDir, "prs")
+		if cfg.PRArchiveDir != "" {
+			root = resolve(baseDir, cfg.PRArchiveDir)
+		}
+		var ast archiveStats
+		for _, r := range results {
+			if r.repo == "" {
+				continue
+			}
+			s := archiveProject(r.repo, cfg.GithubAuthor, root, r.prs, *dryRun)
+			ast.written += s.written
+			ast.unchanged += s.unchanged
+			for _, w := range s.warns {
+				fmt.Fprintln(os.Stderr, "warn: "+w)
+			}
+		}
+		fmt.Printf("prs: %d archived, %d unchanged\n", ast.written, ast.unchanged)
+	}
+
 	if *dryRun {
 		fmt.Printf("done (dry run): %d would change, %d unchanged\n", written, unchanged)
 	} else {
@@ -451,6 +474,7 @@ func collectProject(p Project, baseDir string, authors []string, ghAuthor string
 		d.warns = append(d.warns, fmt.Sprintf("%s: no github remote, skipping PRs: %v", p.Name, err))
 		return d
 	}
+	d.repo = repo
 	d.repoURL = "https://github.com/" + repo
 	prs, err := ghPRList(repo, ghAuthor, since)
 	if err != nil {
@@ -460,6 +484,7 @@ func collectProject(p Project, baseDir string, authors []string, ghAuthor string
 	if len(prs) == ghPRLimit {
 		d.warns = append(d.warns, fmt.Sprintf("%s: gh returned exactly %d PRs, results may be truncated", p.Name, ghPRLimit))
 	}
+	d.prs = prs
 	for _, pr := range prs {
 		d.prEvents = append(d.prEvents, prEvents(pr, since, d.repoURL)...)
 	}
@@ -677,13 +702,28 @@ func dominantBranch(tally map[string]int, preferred []string) string {
 
 const ghPRLimit = 300
 
+// gh caches the shared GraphQL metadata that `pr list --author` needs (the
+// SearchType enum) under ~/.cache/gh with a plain create+write, no atomic
+// rename. Projects are collected in parallel, so two gh processes hit that one
+// repo-independent file at once, interleave into a corrupt body, and then every
+// `pr list --author` on the machine fails with "invalid character 'd' after
+// object key" until the 24h TTL expires. Serialize the gh calls; there is one
+// per project and each is fast.
+var ghMu sync.Mutex
+
 func ghPRList(repo, author, sinceISO string) ([]ghPR, error) {
 	// updated:>= is a superset of every PR with a created/merged/closed event
 	// in range (all of those bump updatedAt), and keeps the payload small.
-	out, err := runCmd("gh", "pr", "list", "-R", repo,
+	// An empty sinceISO lists every PR (the archive's first fill).
+	args := []string{"pr", "list", "-R", repo,
 		"--author", author, "--state", "all", "--limit", strconv.Itoa(ghPRLimit),
-		"--search", "updated:>="+sinceISO,
-		"--json", "number,title,state,createdAt,mergedAt,closedAt,headRefName,baseRefName,additions,deletions")
+		"--json", "number,title,state,createdAt,mergedAt,closedAt,headRefName,baseRefName,additions,deletions"}
+	if sinceISO != "" {
+		args = append(args, "--search", "updated:>="+sinceISO)
+	}
+	ghMu.Lock()
+	out, err := runCmd("gh", args...)
+	ghMu.Unlock()
 	if err != nil {
 		return nil, err
 	}

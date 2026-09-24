@@ -38,6 +38,7 @@ Copy `config.example.json` to `config.json` and fill in your values
 | `outputDir`         | where `.md` files are written (relative to this config)        |
 | `preferredBranches` | branch-guess tie-break order, default `["qa"]`                 |
 | `projects`          | `[{ "name": "<heading>", "path": "<repo, relative to config>" }]` |
+| `prArchiveDir`      | full PR archive dir, default `<outputDir>/prs`; `"off"` disables |
 
 Add a project by appending to `projects` — paths are resolved relative to
 `config.json`.
@@ -88,3 +89,19 @@ and is yours to edit once the file exists.
   that cell's commits (one `git log` per ref, mapped hash -> branches); ties
   prefer `preferredBranches`. It's a guess; edit it freely, your edit is
   outside the markers so it sticks.
+
+## PR archive
+
+Every run also keeps a full offline copy of your PRs in `prs/<repo>/`:
+
+- `<n>.json`: the raw `gh pr view` payload (description, commits, files,
+  reviews, comments, labels) plus `reviewComments`, the inline line comments
+  from the REST API that `gh pr view` does not expose.
+- `<n>.md`: a readable render: header, description, commits, files, and one
+  chronological discussion timeline (reviews + comments + inline comments),
+  times in ET.
+
+The first run for a project fetches every PR you authored. After that, only
+PRs updated inside the week window are refetched, and a file is rewritten only
+when its content changed (`prs: N archived, M unchanged`). `-n` reports what
+would change.

@@ -455,3 +455,54 @@ func TestParseGitLogConvertsToET(t *testing.T) {
 		}
 	}
 }
+
+func TestParseReviewComments(t *testing.T) {
+	out := []byte(`{"user":"a","path":"x.go","line":3,"body":"hi","createdAt":"2026-09-01T12:00:00Z"}
+{"user":"b","path":"y.go","line":null,"body":"outdated","createdAt":"2026-09-01T13:00:00Z"}
+`)
+	rcs, err := parseReviewComments(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rcs) != 2 || *rcs[0].Line != 3 || rcs[1].Line != nil {
+		t.Fatalf("got %+v", rcs)
+	}
+	if rcs, _ := parseReviewComments(nil); rcs == nil || len(rcs) != 0 {
+		t.Fatalf("empty input should give empty non-nil slice, got %#v", rcs)
+	}
+}
+
+func TestRenderPRMarkdown(t *testing.T) {
+	line := 7
+	var pr prDetail
+	pr.Number, pr.Title, pr.State, pr.URL = 5, "feat: x", "MERGED", "https://github.com/o/r/pull/5"
+	pr.CreatedAt, pr.MergedAt = "2026-09-01T14:00:00Z", "2026-09-02T01:20:00Z"
+	pr.Author.Login = "me"
+	pr.ReviewComments = []reviewComment{{User: "rev", Path: "a.go", Line: &line, Body: "nit", CreatedAt: "2026-09-01T16:00:00Z"}}
+	pr.Comments = append(pr.Comments, struct {
+		Author    ghUser `json:"author"`
+		Body      string `json:"body"`
+		CreatedAt string `json:"createdAt"`
+	}{ghUser{"me"}, "thanks", "2026-09-01T15:00:00Z"})
+	md := renderPRMarkdown(pr)
+	for _, want := range []string{
+		"# #5 feat: x",
+		"- Merged: 2026-09-01 21:20 ET", // UTC next day, ET same evening
+		"_(no description)_",
+		"### me commented (2026-09-01 11:00 ET)",
+		"### rev on `a.go:7` (2026-09-01 12:00 ET)",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("missing %q in:\n%s", want, md)
+		}
+	}
+	if strings.Index(md, "me commented") > strings.Index(md, "rev on") {
+		t.Error("discussion should be chronological")
+	}
+}
+
+func TestRepoSlug(t *testing.T) {
+	if got := repoSlug("acme/widgets"); got != "widgets" {
+		t.Errorf("got %q", got)
+	}
+}
